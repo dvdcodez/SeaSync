@@ -156,11 +156,18 @@ struct MenuBarView: View {
 
             if !appState.errors.isEmpty {
                 Button {
-                    // Show errors window
+                    openErrorsWindow()
                 } label: {
                     Label("View Errors (\(appState.errors.count))", systemImage: "exclamationmark.triangle")
                 }
                 .foregroundColor(.red)
+                .buttonStyle(.plain)
+
+                Button {
+                    appState.errors.removeAll()
+                } label: {
+                    Label("Clear Errors", systemImage: "xmark.circle")
+                }
                 .buttonStyle(.plain)
             }
         }
@@ -185,6 +192,7 @@ struct MenuBarView: View {
     // MARK: - Actions
 
     @State private var setupWindow: NSWindow?
+    @State private var errorsWindow: NSWindow?
 
     private func openSetupWindow() {
         // Close existing window if any
@@ -209,6 +217,97 @@ struct MenuBarView: View {
     private func openSyncFolder() {
         let url = URL(fileURLWithPath: SyncConfig.localSyncPath)
         NSWorkspace.shared.open(url)
+    }
+
+    private func openErrorsWindow() {
+        errorsWindow?.close()
+
+        let window = NSWindow(
+            contentRect: NSRect(x: 0, y: 0, width: 500, height: 400),
+            styleMask: [.titled, .closable, .resizable],
+            backing: .buffered,
+            defer: false
+        )
+        window.title = "Sync Errors"
+        window.center()
+        window.isReleasedWhenClosed = false
+        window.contentView = NSHostingView(rootView: ErrorsView().environmentObject(appState))
+        window.makeKeyAndOrderFront(nil)
+        NSApp.activate(ignoringOtherApps: true)
+
+        errorsWindow = window
+    }
+}
+
+// MARK: - Errors View
+
+struct ErrorsView: View {
+    @EnvironmentObject var appState: AppState
+
+    var body: some View {
+        VStack(alignment: .leading, spacing: 0) {
+            HStack {
+                Text("Sync Errors")
+                    .font(.headline)
+                Spacer()
+                Text("\(appState.errors.count) errors")
+                    .foregroundColor(.secondary)
+            }
+            .padding()
+
+            Divider()
+
+            if appState.errors.isEmpty {
+                VStack {
+                    Spacer()
+                    Text("No errors")
+                        .foregroundColor(.secondary)
+                    Spacer()
+                }
+            } else {
+                List(appState.errors.reversed()) { error in
+                    VStack(alignment: .leading, spacing: 4) {
+                        HStack {
+                            if let library = error.libraryName {
+                                Text(library)
+                                    .font(.caption)
+                                    .padding(.horizontal, 6)
+                                    .padding(.vertical, 2)
+                                    .background(Color.blue.opacity(0.2))
+                                    .cornerRadius(4)
+                            }
+                            Text(error.timestamp, style: .relative)
+                                .font(.caption)
+                                .foregroundColor(.secondary)
+                        }
+                        Text(error.message)
+                            .font(.system(.body, design: .monospaced))
+                            .lineLimit(3)
+                        if let filePath = error.filePath {
+                            Text(filePath)
+                                .font(.caption)
+                                .foregroundColor(.secondary)
+                        }
+                    }
+                    .padding(.vertical, 4)
+                }
+            }
+
+            Divider()
+
+            HStack {
+                Button("Clear All") {
+                    appState.errors.removeAll()
+                }
+                Spacer()
+                Button("Close") {
+                    NSApp.keyWindow?.close()
+                }
+                .keyboardShortcut(.defaultAction)
+            }
+            .padding()
+        }
+        .frame(minWidth: 400, minHeight: 300)
     }
 }
 

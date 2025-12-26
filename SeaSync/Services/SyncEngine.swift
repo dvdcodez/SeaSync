@@ -26,8 +26,15 @@ class SyncEngine {
         isSyncing = true
         log("Starting full sync")
 
+        // CRITICAL: Always reset isSyncing when done, even on errors
+        defer {
+            isSyncing = false
+            log("Sync finished, isSyncing reset to false")
+        }
+
         appState?.syncStatus = .syncing
         appState?.currentOperation = "Starting sync..."
+        var hadErrors = false
 
         do {
             // Get all libraries
@@ -36,20 +43,32 @@ class SyncEngine {
             appState?.libraries = libraries
             log("Got \(libraries.count) libraries, starting sync")
 
-            // Sync each library
+            // Sync each library (continue even if one fails)
             for (index, library) in libraries.enumerated() {
                 appState?.currentOperation = "Syncing \(library.name)..."
                 appState?.syncProgress = Double(index) / Double(libraries.count)
                 log("Syncing library: \(library.name) (\(index + 1)/\(libraries.count))")
 
-                try await syncLibrary(library)
+                do {
+                    try await syncLibrary(library)
+                } catch {
+                    log("Error syncing library \(library.name): \(error)")
+                    hadErrors = true
+                    appState?.errors.append(SyncError(
+                        message: error.localizedDescription,
+                        timestamp: Date(),
+                        libraryName: library.name,
+                        filePath: nil
+                    ))
+                    // Continue with next library
+                }
             }
 
-            appState?.syncStatus = .idle
+            appState?.syncStatus = hadErrors ? .error : .idle
             appState?.lastSyncTime = Date()
             appState?.currentOperation = ""
             appState?.syncProgress = 1.0
-            log("Full sync completed successfully")
+            log("Full sync completed \(hadErrors ? "with errors" : "successfully")")
 
         } catch {
             log("Sync error: \(error)")
@@ -61,8 +80,6 @@ class SyncEngine {
                 filePath: nil
             ))
         }
-
-        isSyncing = false
     }
 
     // MARK: - Library Sync
@@ -168,9 +185,25 @@ class SyncEngine {
             }
         }
 
-        // Execute actions
-        for action in actions {
-            try await executeAction(action, library: library)
+        // Execute actions (continue even if some fail)
+        var failedActions = 0
+        for (index, action) in actions.enumerated() {
+            do {
+                try await executeAction(action, library: library)
+            } catch {
+                failedActions += 1
+                log("Action failed (\(index + 1)/\(actions.count)): \(action) - \(error.localizedDescription)")
+                appState?.errors.append(SyncError(
+                    message: error.localizedDescription,
+                    timestamp: Date(),
+                    libraryName: library.name,
+                    filePath: action.path
+                ))
+                // Continue with next action
+            }
+        }
+        if failedActions > 0 {
+            log("\(failedActions) actions failed out of \(actions.count)")
         }
 
         // Save new sync state
