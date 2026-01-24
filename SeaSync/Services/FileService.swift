@@ -3,6 +3,14 @@ import Foundation
 class FileService {
     private let account: Account
 
+    // URLSession with longer timeout for large file transfers
+    private lazy var transferSession: URLSession = {
+        let config = URLSessionConfiguration.default
+        config.timeoutIntervalForRequest = 300  // 5 minutes
+        config.timeoutIntervalForResource = 3600  // 1 hour for large files
+        return URLSession(configuration: config)
+    }()
+
     init(account: Account) {
         self.account = account
     }
@@ -11,8 +19,10 @@ class FileService {
 
     func listDirectory(libraryId: String, path: String = "/") async throws -> [SeafFile] {
         let encodedPath = path.addingPercentEncoding(withAllowedCharacters: .urlQueryAllowed) ?? path
+
+        // Note: Seafile API returns all files in one response, pagination params are ignored
         let url = account.apiURL("api2/repos/\(libraryId)/dir/?p=\(encodedPath)")
-        log("listDirectory: \(url)")
+        log("listDirectory: \(path)")
 
         var request = URLRequest(url: url)
         request.httpMethod = "GET"
@@ -26,19 +36,15 @@ class FileService {
             throw APIError.invalidResponse
         }
 
-        log("listDirectory status: \(httpResponse.statusCode)")
-
         guard httpResponse.statusCode == 200 else {
             let body = String(data: data, encoding: .utf8) ?? "no body"
             log("listDirectory error: \(body)")
             throw APIError.serverError(httpResponse.statusCode)
         }
 
-        log("listDirectory response: \(String(data: data, encoding: .utf8) ?? "nil")")
-
         do {
             let files = try JSONDecoder().decode([SeafFile].self, from: data)
-            log("listDirectory: got \(files.count) files")
+            log("listDirectory: \(path) -> \(files.count) files")
             return files
         } catch {
             log("listDirectory decode error: \(error)")
@@ -62,6 +68,89 @@ class FileService {
             }
         }
 
+        return allFiles
+    }
+
+    /// Parallel version of listAllFiles using TaskGroup for better performance
+    func listAllFilesParallel(libraryId: String) async throws -> [DirectoryEntry] {
+        // Actor for thread-safe collection of results
+        actor FileCollector {
+            var files: [DirectoryEntry] = []
+            var pendingDirs: [String] = ["/"]
+            var activeCount = 0
+
+            func addFiles(_ entries: [DirectoryEntry]) {
+                files.append(contentsOf: entries)
+            }
+
+            func addDirs(_ dirs: [String]) {
+                pendingDirs.append(contentsOf: dirs)
+            }
+
+            func nextDir() -> String? {
+                guard !pendingDirs.isEmpty else { return nil }
+                activeCount += 1
+                return pendingDirs.removeFirst()
+            }
+
+            func finished() {
+                activeCount -= 1
+            }
+
+            func isDone() -> Bool {
+                pendingDirs.isEmpty && activeCount == 0
+            }
+
+            func getAll() -> [DirectoryEntry] {
+                files
+            }
+
+            func getProgress() -> (dirs: Int, files: Int) {
+                (pendingDirs.count + activeCount, files.count)
+            }
+        }
+
+        let collector = FileCollector()
+        let maxConcurrent = 6  // Limit parallel API calls to avoid overwhelming server
+
+        log("listAllFilesParallel: starting parallel fetch for library \(libraryId)")
+
+        while await !collector.isDone() {
+            try await withThrowingTaskGroup(of: ([DirectoryEntry], [String]).self) { group in
+                // Launch up to maxConcurrent parallel directory fetches
+                for _ in 0..<maxConcurrent {
+                    guard let dir = await collector.nextDir() else { break }
+
+                    group.addTask {
+                        let files = try await self.listDirectory(libraryId: libraryId, path: dir)
+                        var entries: [DirectoryEntry] = []
+                        var subdirs: [String] = []
+
+                        for file in files {
+                            entries.append(DirectoryEntry(path: dir, file: file))
+                            if file.isDirectory {
+                                let subPath = dir == "/" ? "/\(file.name)" : "\(dir)/\(file.name)"
+                                subdirs.append(subPath)
+                            }
+                        }
+                        return (entries, subdirs)
+                    }
+                }
+
+                // Collect results from all tasks in this batch
+                for try await (entries, subdirs) in group {
+                    await collector.addFiles(entries)
+                    await collector.addDirs(subdirs)
+                    await collector.finished()
+                }
+            }
+
+            let progress = await collector.getProgress()
+            log("listAllFilesParallel: \(progress.files) files found, \(progress.dirs) dirs pending")
+        }
+
+        let allFiles = await collector.getAll()
+        log("listAllFilesParallel: completed with \(allFiles.count) total files")
         return allFiles
     }
 
@@ -97,9 +186,12 @@ class FileService {
     }
 
     func downloadFile(libraryId: String, remotePath: String, to localPath: URL) async throws {
+        log("downloadFile: getting link for \(remotePath)")
         let downloadURL = try await getDownloadLink(libraryId: libraryId, path: remotePath)
+        log("downloadFile: starting download from \(downloadURL)")
 
-        let (tempURL, response) = try await URLSession.shared.download(from: downloadURL)
+        let (tempURL, response) = try await transferSession.download(from: downloadURL)
+        log("downloadFile: download complete, checking response")
 
         guard let httpResponse = response as? HTTPURLResponse,
               httpResponse.statusCode == 200 else {
@@ -109,6 +201,7 @@ class FileService {
         // Create parent directory if needed
         let parentDir = localPath.deletingLastPathComponent()
         try FileManager.default.createDirectory(at: parentDir, withIntermediateDirectories: true)
+        log("downloadFile: moving to \(localPath.path)")
 
         // Remove existing file if any
         try? FileManager.default.removeItem(at: localPath)

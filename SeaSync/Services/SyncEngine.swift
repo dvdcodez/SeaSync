@@ -8,6 +8,8 @@ class SyncEngine {
     private weak var appState: AppState?
 
     private var isSyncing = false
+    private var isPaused = false
+    private var shouldStop = false
 
     init(account: Account, appState: AppState) {
         self.account = account
@@ -15,6 +17,31 @@ class SyncEngine {
         self.libraryService = LibraryService(account: account)
         self.fileService = FileService(account: account)
     }
+
+    // MARK: - Sync Control
+
+    func pause() {
+        guard isSyncing else { return }
+        isPaused = true
+        appState?.syncStatus = .paused
+        log("Sync paused")
+    }
+
+    func resume() {
+        guard isPaused else { return }
+        isPaused = false
+        appState?.syncStatus = .syncing
+        log("Sync resumed")
+    }
+
+    func stop() {
+        shouldStop = true
+        isPaused = false
+        log("Sync stop requested")
+    }
+
+    var isSyncActive: Bool { isSyncing }
+    var isSyncPaused: Bool { isPaused }
 
     // MARK: - Full Sync
 
@@ -26,14 +53,21 @@ class SyncEngine {
         isSyncing = true
         log("Starting full sync")
 
-        // CRITICAL: Always reset isSyncing when done, even on errors
+        // Mark sync as in progress for crash detection
+        SyncDatabase.shared.setSyncInProgress(true)
+
+        // CRITICAL: Always reset state when done, even on errors
         defer {
             isSyncing = false
-            log("Sync finished, isSyncing reset to false")
+            isPaused = false
+            shouldStop = false
+            SyncDatabase.shared.setSyncInProgress(false)
+            log("Sync finished, state reset")
         }
 
         appState?.syncStatus = .syncing
         appState?.currentOperation = "Starting sync..."
+        appState?.resetProgress()
         var hadErrors = false
 
         do {
@@ -49,21 +83,35 @@ class SyncEngine {
                 appState?.syncProgress = Double(index) / Double(libraries.count)
                 log("Syncing library: \(library.name) (\(index + 1)/\(libraries.count))")
 
+                // Track which library is being synced for crash recovery
+                SyncDatabase.shared.setLastSyncLibrary(library.id)
+
                 do {
                     try await syncLibrary(library)
                 } catch {
                     log("Error syncing library \(library.name): \(error)")
                     hadErrors = true
+
+                    // Add to in-memory errors
                     appState?.errors.append(SyncError(
                         message: error.localizedDescription,
                         timestamp: Date(),
                         libraryName: library.name,
                         filePath: nil
                     ))
+
+                    // Persist error to database
+                    SyncDatabase.shared.saveError(PersistedSyncError(
+                        message: error.localizedDescription,
+                        libraryName: library.name,
+                        filePath: nil,
+                        errorType: "sync"
+                    ))
                     // Continue with next library
                 }
             }
 
+            SyncDatabase.shared.setLastSyncLibrary(nil)
             appState?.syncStatus = hadErrors ? .error : .idle
             appState?.lastSyncTime = Date()
             appState?.currentOperation = ""
@@ -73,11 +121,21 @@ class SyncEngine {
         } catch {
             log("Sync error: \(error)")
             appState?.syncStatus = .error
+
+            // Add to in-memory errors
             appState?.errors.append(SyncError(
                 message: error.localizedDescription,
                 timestamp: Date(),
                 libraryName: nil,
                 filePath: nil
+            ))
+
+            // Persist error to database
+            SyncDatabase.shared.saveError(PersistedSyncError(
+                message: error.localizedDescription,
+                libraryName: nil,
+                filePath: nil,
+                errorType: "sync"
             ))
         }
     }
@@ -99,9 +157,10 @@ class SyncEngine {
             withIntermediateDirectories: true
         )
 
-        // Get remote files
+        // Get remote files (using parallel fetch for better performance)
         log("Listing remote files for library \(library.id)")
-        let remoteFiles = try await fileService.listAllFiles(libraryId: library.id)
+        appState?.currentOperation = "Scanning \(library.name)..."
+        let remoteFiles = try await fileService.listAllFilesParallel(libraryId: library.id)
         log("Got \(remoteFiles.count) remote files")
 
         // Get local files
@@ -115,12 +174,55 @@ class SyncEngine {
         let remotePathSet = Set(remoteFiles.map { $0.fullPath })
         let localPathSet = Set(localFiles.keys)
 
+        // Build a map of remote files for quick lookup
+        let remoteFileMap = Dictionary(uniqueKeysWithValues: remoteFiles.map { ($0.fullPath, $0) })
+
         // Calculate sync actions
         var actions: [SyncAction] = []
+
+        // Check for incomplete downloads from previous run
+        let incompleteDownloads = SyncDatabase.shared.getIncompleteDownloads(libraryId: library.id)
+        var resumedCount = 0
+
+        for incomplete in incompleteDownloads {
+            // Check if file still needs download (remote still has it, local doesn't)
+            if let remoteEntry = remoteFileMap[incomplete.remotePath] {
+                if !localFiles.keys.contains(incomplete.remotePath) {
+                    // Still need to download this file
+                    let localPath = library.localPath.appendingPathComponent(
+                        String(incomplete.remotePath.dropFirst())
+                    )
+                    actions.append(.download(remotePath: incomplete.remotePath, localPath: localPath))
+                    resumedCount += 1
+                } else {
+                    // File exists locally now - check if it matches the expected version
+                    if let localMtime = localFiles[incomplete.remotePath], localMtime >= remoteEntry.file.mtime {
+                        // Already completed somehow, mark as done
+                        SyncDatabase.shared.markDownloadCompleted(libraryId: library.id, remotePath: incomplete.remotePath)
+                    }
+                }
+            } else {
+                // Remote file no longer exists, clear the progress entry
+                SyncDatabase.shared.markDownloadCompleted(libraryId: library.id, remotePath: incomplete.remotePath)
+            }
+        }
+
+        if resumedCount > 0 {
+            log("Resuming \(resumedCount) incomplete downloads from previous sync")
+        }
+
+        // Track paths we're already handling from resume
+        let resumingPaths = Set(incompleteDownloads.map { $0.remotePath })
 
         // 1. Download new/updated files from server
         for entry in remoteFiles {
             let remotePath = entry.fullPath
+
+            // Skip if we're already resuming this file
+            if resumingPaths.contains(remotePath) {
+                continue
+            }
+
             let localPath = library.localPath.appendingPathComponent(
                 String(remotePath.dropFirst()) // Remove leading "/"
             )
@@ -131,6 +233,12 @@ class SyncEngine {
                     actions.append(.createDirectory(localPath: localPath))
                 }
             } else {
+                // Check if file was already completed in a previous interrupted sync
+                if SyncDatabase.shared.isFileCompleted(libraryId: library.id, path: remotePath, mtime: entry.file.mtime) {
+                    // Skip - we already downloaded this exact version
+                    continue
+                }
+
                 // Check if file needs download
                 if let localMtime = localFiles[remotePath] {
                     if entry.file.mtime > localMtime {
@@ -185,23 +293,193 @@ class SyncEngine {
             }
         }
 
-        // Execute actions (continue even if some fail)
-        var failedActions = 0
-        for (index, action) in actions.enumerated() {
-            do {
-                try await executeAction(action, library: library)
-            } catch {
-                failedActions += 1
-                log("Action failed (\(index + 1)/\(actions.count)): \(action) - \(error.localizedDescription)")
-                appState?.errors.append(SyncError(
-                    message: error.localizedDescription,
-                    timestamp: Date(),
-                    libraryName: library.name,
-                    filePath: action.path
-                ))
-                // Continue with next action
+        // Count actions by type for progress tracking
+        let downloads = actions.filter { if case .download = $0 { return true }; return false }.count
+        let uploads = actions.filter { if case .upload = $0 { return true }; return false }.count
+        let deletes = actions.filter {
+            if case .deleteLocal = $0 { return true }
+            if case .deleteRemote = $0 { return true }
+            return false
+        }.count
+
+        appState?.totalDownloads += downloads
+        appState?.totalUploads += uploads
+        appState?.totalDeletes += deletes
+
+        log("Actions: \(downloads) downloads, \(uploads) uploads, \(deletes) deletes")
+
+        // Register pending downloads in the progress table
+        for action in actions {
+            if case .download(let remotePath, _) = action {
+                if let entry = remoteFileMap[remotePath] {
+                    SyncDatabase.shared.addPendingDownload(
+                        libraryId: library.id,
+                        remotePath: remotePath,
+                        objectId: entry.file.id,
+                        mtime: entry.file.mtime,
+                        size: entry.file.size ?? 0
+                    )
+                }
             }
         }
+
+        // Execute actions with streaming parallelism - always keep maxConcurrent tasks running
+        let maxConcurrent = 8
+        var failedActions = 0
+        var nextActionIndex = 0
+        let fileService = self.fileService
+        let libraryId = library.id
+        let totalActions = actions.count
+
+        log("Starting to execute \(totalActions) actions with \(maxConcurrent) parallel workers...")
+
+        // Track active files for display in menu
+        var activeFileNames: [String] = []
+
+        // Batch counters - only push to UI periodically
+        var pendingDownloads = 0
+        var pendingUploads = 0
+        var pendingDeletes = 0
+
+        func updateUI() {
+            // Update all UI state at once
+            appState?.activeFiles = activeFileNames
+            appState?.completedDownloads += pendingDownloads
+            appState?.completedUploads += pendingUploads
+            appState?.completedDeletes += pendingDeletes
+            pendingDownloads = 0
+            pendingUploads = 0
+            pendingDeletes = 0
+        }
+
+        func addActiveFile(_ name: String) {
+            activeFileNames.append(name)
+            updateUI()
+        }
+
+        func removeActiveFile(_ name: String) {
+            activeFileNames.removeAll { $0 == name }
+            updateUI()
+        }
+
+        await withTaskGroup(of: (Int, SyncAction, String, Error?).self) { group in
+            // Start initial batch
+            while nextActionIndex < min(maxConcurrent, totalActions) {
+                let index = nextActionIndex
+                let action = actions[index]
+                let fileName = action.path ?? "file"
+                nextActionIndex += 1
+                addActiveFile(fileName)
+
+                group.addTask {
+                    // Mark download as in progress
+                    if case .download(let remotePath, _) = action {
+                        await MainActor.run {
+                            SyncDatabase.shared.markDownloadInProgress(libraryId: libraryId, remotePath: remotePath)
+                        }
+                    }
+
+                    let error = await self.executeFileOperation(action, fileService: fileService, libraryId: libraryId)
+                    return (index, action, fileName, error)
+                }
+            }
+
+            // Process results as they complete, immediately starting new tasks
+            for await (index, action, fileName, error) in group {
+                removeActiveFile(fileName)
+
+                // Update download progress in database
+                if case .download(let remotePath, _) = action {
+                    if let error = error {
+                        SyncDatabase.shared.markDownloadFailed(libraryId: libraryId, remotePath: remotePath, errorMessage: error.localizedDescription)
+                    } else {
+                        SyncDatabase.shared.markDownloadCompleted(libraryId: libraryId, remotePath: remotePath)
+                    }
+                }
+
+                // Update UI immediately when each task completes
+                if let error = error {
+                    failedActions += 1
+                    log("Action \(index + 1) failed: \(action) - \(error.localizedDescription)")
+
+                    // Add to in-memory errors
+                    appState?.errors.append(SyncError(
+                        message: error.localizedDescription,
+                        timestamp: Date(),
+                        libraryName: library.name,
+                        filePath: action.path
+                    ))
+
+                    // Persist error to database
+                    SyncDatabase.shared.saveError(PersistedSyncError(
+                        message: error.localizedDescription,
+                        libraryName: library.name,
+                        filePath: action.path,
+                        errorType: "sync"
+                    ))
+                }
+
+                // Update progress counters (batched)
+                switch action {
+                case .download:
+                    pendingDownloads += 1
+                case .upload:
+                    pendingUploads += 1
+                case .deleteLocal, .deleteRemote:
+                    pendingDeletes += 1
+                default:
+                    break
+                }
+
+                // Check for stop request
+                if shouldStop {
+                    log("Sync stopped by user")
+                    group.cancelAll()
+                    break
+                }
+
+                // Wait while paused
+                while isPaused && !shouldStop {
+                    try? await Task.sleep(nanoseconds: 100_000_000) // 100ms
+                }
+
+                // Start next task immediately if there are more
+                if nextActionIndex < totalActions && !shouldStop {
+                    let nextIndex = nextActionIndex
+                    let nextAction = actions[nextIndex]
+                    let nextFileName = nextAction.path ?? "file"
+                    nextActionIndex += 1
+                    addActiveFile(nextFileName)
+
+                    group.addTask {
+                        // Mark download as in progress
+                        if case .download(let remotePath, _) = nextAction {
+                            await MainActor.run {
+                                SyncDatabase.shared.markDownloadInProgress(libraryId: libraryId, remotePath: remotePath)
+                            }
+                        }
+
+                        let error = await self.executeFileOperation(nextAction, fileService: fileService, libraryId: libraryId)
+                        return (nextIndex, nextAction, nextFileName, error)
+                    }
+                }
+
+                // Update UI periodically (throttled to reduce flickering)
+                updateUI()
+
+                // Log progress periodically
+                let completed = (appState?.completedDownloads ?? 0) + pendingDownloads +
+                               (appState?.completedUploads ?? 0) + pendingUploads +
+                               (appState?.completedDeletes ?? 0) + pendingDeletes
+                if completed % 50 == 0 {
+                    log("Progress: \(completed)/\(totalActions) actions completed")
+                }
+            }
+        }
+
+        // Flush pending counters when done
+        updateUI()
+
         if failedActions > 0 {
             log("\(failedActions) actions failed out of \(actions.count)")
         }
@@ -218,9 +496,46 @@ class SyncEngine {
             )
         }
         SyncDatabase.shared.saveSyncState(newState)
+
+        // Clear completed downloads after successful sync
+        SyncDatabase.shared.clearCompletedDownloads(libraryId: library.id)
     }
 
     // MARK: - Execute Actions
+
+    /// Execute a file operation off the main actor for true parallelism
+    nonisolated private func executeFileOperation(_ action: SyncAction, fileService: FileService, libraryId: String) async -> Error? {
+        do {
+            switch action {
+            case .download(let remotePath, let localPath):
+                try await fileService.downloadFile(
+                    libraryId: libraryId,
+                    remotePath: remotePath,
+                    to: localPath
+                )
+            case .upload(let localPath, let remotePath):
+                try await fileService.uploadFile(
+                    libraryId: libraryId,
+                    localPath: localPath,
+                    remotePath: remotePath
+                )
+            case .deleteLocal(let localPath):
+                try? FileManager.default.removeItem(at: localPath)
+            case .deleteRemote(let remotePath):
+                try await fileService.deleteFile(libraryId: libraryId, path: remotePath)
+            case .createDirectory(let localPath):
+                try FileManager.default.createDirectory(
+                    at: localPath,
+                    withIntermediateDirectories: true
+                )
+            case .conflict:
+                break
+            }
+            return nil
+        } catch {
+            return error
+        }
+    }
 
     private func executeAction(_ action: SyncAction, library: Library) async throws {
         switch action {

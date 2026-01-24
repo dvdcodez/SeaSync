@@ -58,3 +58,93 @@ enum SyncAction: CustomStringConvertible {
         }
     }
 }
+
+struct SyncStats {
+    var totalFiles: Int = 0
+    var totalDirectories: Int = 0
+    var totalSize: Int64 = 0
+    var libraryCount: Int = 0
+    var libraryLastSync: [String: Date] = [:]
+    var oldestSync: Date?
+    var newestSync: Date?
+
+    var formattedSize: String {
+        let formatter = ByteCountFormatter()
+        formatter.allowedUnits = [.useKB, .useMB, .useGB]
+        formatter.countStyle = .file
+        return formatter.string(fromByteCount: totalSize)
+    }
+}
+
+// MARK: - Download Progress Tracking
+
+enum DownloadStatus: String, Codable {
+    case pending
+    case inProgress = "in_progress"
+    case completed
+    case failed
+}
+
+struct DownloadProgress: Codable, Identifiable {
+    let id: Int64
+    let libraryId: String
+    let remotePath: String
+    let objectId: String
+    let mtime: Int64
+    let size: Int64
+    let status: DownloadStatus
+    let startedAt: Date?
+    let completedAt: Date?
+    let errorMessage: String?
+
+    init(
+        id: Int64 = 0,
+        libraryId: String,
+        remotePath: String,
+        objectId: String,
+        mtime: Int64,
+        size: Int64,
+        status: DownloadStatus = .pending,
+        startedAt: Date? = nil,
+        completedAt: Date? = nil,
+        errorMessage: String? = nil
+    ) {
+        self.id = id
+        self.libraryId = libraryId
+        self.remotePath = remotePath
+        self.objectId = objectId
+        self.mtime = mtime
+        self.size = size
+        self.status = status
+        self.startedAt = startedAt
+        self.completedAt = completedAt
+        self.errorMessage = errorMessage
+    }
+}
+
+// MARK: - Persisted Error
+
+struct PersistedSyncError: Codable, Identifiable {
+    let id: Int64
+    let timestamp: Date
+    let message: String
+    let libraryName: String?
+    let filePath: String?
+    let errorType: String
+
+    init(
+        id: Int64 = 0,
+        timestamp: Date = Date(),
+        message: String,
+        libraryName: String? = nil,
+        filePath: String? = nil,
+        errorType: String = "sync"
+    ) {
+        self.id = id
+        self.timestamp = timestamp
+        self.message = message
+        self.libraryName = libraryName
+        self.filePath = filePath
+        self.errorType = errorType
+    }
+}
